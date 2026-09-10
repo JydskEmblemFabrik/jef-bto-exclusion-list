@@ -3,20 +3,22 @@
 //   https://documentation.chainbox.dk/chainbox-api/pim-api/lookuplist/
 //   https://documentation.chainbox.dk/chainbox-api/pim-api/lookuplistitem/
 //
-// Why this API, and not BTO-management's internal one: JEF already has a
-// working, properly-provisioned API user for PIM (issued by Chainbox for an
-// earlier project) — no new request to Chainbox needed. And structurally,
-// BTO's configurator "picklists" and "picklist items" line up almost exactly
-// with PIM's generic "Lookup List" / "Lookup List Item" resources (same
-// code / label / sortorder shape, items reference their parent list). This
-// script assumes that's the same underlying data; the very first run's log
-// output includes a sanity check against the known-good manual list (910
-// SKUs, see data/exclusion-list.json's seed data) so that assumption gets
-// confirmed or refuted immediately, in plain sight, rather than silently.
+// STATUS (2026-09-10, run #1): the "Lookup List" / "Lookup List Item" API
+// turned out NOT to be BTO's configurator picklists. The very first live run
+// found 19 lookup lists (variant, farve, hoejde, bagmontering, diameter, ...)
+// and 1824 lookup list items, but ZERO of them carry a SKU under any of the
+// field names this script checks. Those lookup lists look like generic PIM
+// attribute/variant dictionaries (colour names, height values, mounting
+// types, diameters used for building product *variants* inside PIM itself),
+// not BTO's "which SKU does this configurator choice map to" data.
 //
-// This script is READ-ONLY by design (GET requests only), even though the
-// credential JEF has also carries write access — no endpoint here can
-// modify PIM data.
+// This script is being kept, with a hard safety floor (see MIN_SKUS below)
+// and a debug dump of raw item shapes, so we can either (a) find the real
+// field the SKU lives under, if this data does relate to BTO after all, or
+// (b) conclude this PIM endpoint is the wrong data source and go back to
+// Chainbox for BTO-management's own API instead. Either way, this script
+// must NEVER silently overwrite a known-good exclusion list with a
+// low/zero-confidence result — that's what MIN_SKUS enforces.
 //
 // Required GitHub Actions secrets (see SETUP.md):
 //   PIM_API_BASE_URL   e.g. https://pim-api.service.chainbox.io
@@ -41,6 +43,15 @@ const ORG_ID = process.env.PIM_ORG_ID || 'jef';
 const PIM_ID = process.env.PIM_PIM_ID || 'pim';
 const USERNAME = process.env.PIM_API_USERNAME;
 const PASSWORD = process.env.PIM_API_PASSWORD;
+
+// Hard floor: never trust (and never write/commit) a result with fewer than
+// this many SKUs. The manual v3 audit found ~910; 0 or a handful is a clear
+// sign this data source or field-mapping is wrong, not that BTO suddenly has
+// almost no configurator picks. Failing loudly (non-zero exit, no file
+// writes) means the "commit if changed" step in the workflow has nothing new
+// to commit, so today's good data (committed manually or by a prior good
+// run) stays live and safe.
+const MIN_SKUS = 500;
 
 if (!USERNAME || !PASSWORD) {
   console.error('Missing PIM_API_USERNAME / PIM_API_PASSWORD secrets.');
@@ -85,7 +96,10 @@ function asRecords(json) {
 }
 
 // SKU could plausibly live under a few different keys depending on how the
-// underlying "fields" collection was configured — check the obvious ones.
+// underlying "fields" collection was configured — check the obvious ones,
+// plus (new) any key anywhere in item.fields whose name contains "sku"
+// case-insensitively, in case the real field has a different exact name
+// (e.g. a custom fields key like "artikelnummer" mapped internally).
 function extractSku(item) {
   const candidates = [
     item.sku,
@@ -96,6 +110,13 @@ function extractSku(item) {
   ];
   for (const c of candidates) {
     if (typeof c === 'string' && c.trim()) return c.trim();
+  }
+  if (item.fields && typeof item.fields === 'object') {
+    for (const [key, value] of Object.entries(item.fields)) {
+      if (/sku/i.test(key) && typeof value === 'string' && value.trim()) {
+        return value.trim();
+      }
+    }
   }
   return null;
 }
@@ -111,12 +132,31 @@ async function main() {
   const listsRaw = await getJson('/lookuplist/lookuplists');
   const lists = asRecords(listsRaw);
   console.log(`  -> ${lists.length} lookup lists total`);
-  console.log('  Sample codes/labels:', lists.slice(0, 5).map((l) => `${l.code} (${l.label})`).join(', '));
+  console.log('  All codes/labels:', lists.map((l) => `${l.code} (${l.label})`).join(', '));
 
   console.log('Fetching all lookup list items...');
   const itemsRaw = await getJson('/lookuplistitem/lookuplistitems');
   const items = asRecords(itemsRaw);
   console.log(`  -> ${items.length} lookup list items total`);
+
+  // --- DEBUG DUMP --------------------------------------------------------
+  // Print the raw shape of a handful of items so we can see the *actual*
+  // field names this API uses, rather than guessing. This is intentionally
+  // verbose and temporary — safe to trim once we've confirmed (or ruled out)
+  // where SKU data lives.
+  console.log('--- DEBUG: raw shape of first 3 lookup list items ---');
+  console.log(JSON.stringify(items.slice(0, 3), null, 2));
+
+  const allFieldKeys = new Set();
+  for (const item of items) {
+    for (const key of Object.keys(item)) allFieldKeys.add(key);
+    if (item.fields && typeof item.fields === 'object') {
+      for (const key of Object.keys(item.fields)) allFieldKeys.add('fields.' + key);
+    }
+  }
+  console.log('--- DEBUG: union of all keys seen across all items ---');
+  console.log([...allFieldKeys].sort().join(', '));
+  // ------------------------------------------------------------------------
 
   const skuToLabels = new Map();
   let itemsWithSku = 0;
@@ -134,32 +174,40 @@ async function main() {
   console.log(`Computed ${skus.length} distinct SKUs to exclude.`);
 
   // Sanity-check against the manually-verified seed list (v3 report, 910
-  // SKUs) so the very first run tells us plainly whether Lookup List data
-  // really is equivalent to BTO's picklists, or whether something's off.
+  // SKUs) so every run tells us plainly whether Lookup List data really is
+  // equivalent to BTO's picklists, or whether something's off.
+  let overlapPctOfSeed = 'n/a';
   try {
     const seed = JSON.parse(await fs.readFile('data/exclusion-list.json', 'utf8'));
     const seedSet = new Set(seed.skus || []);
     const newSet = new Set(skus);
     const overlap = [...newSet].filter((s) => seedSet.has(s)).length;
-    const overlapPctOfSeed = seed.skus?.length ? ((overlap / seed.skus.length) * 100).toFixed(1) : 'n/a';
+    overlapPctOfSeed = seed.skus?.length ? ((overlap / seed.skus.length) * 100).toFixed(1) : 'n/a';
     const overlapPctOfNew = skus.length ? ((overlap / skus.length) * 100).toFixed(1) : 'n/a';
     console.log(`Sanity check vs. previous list (${seed.skus?.length ?? 0} SKUs): ${overlap} SKUs in common ` +
       `(${overlapPctOfSeed}% of the previous list, ${overlapPctOfNew}% of this new one).`);
-    if (Number(overlapPctOfSeed) < 50) {
-      console.warn('WARNING: overlap is low — before trusting this list, manually compare a few SKUs ' +
-        'against the known-good v3 list (e.g. R1-22, DTRIF 999) to confirm the Lookup List API really is BTO\'s picklist data.');
-    }
   } catch {
     console.log('(No previous data/exclusion-list.json to compare against — skipping sanity check.)');
   }
 
-  if (skus.length < 500) {
-    console.warn(
-      `WARNING: this is far fewer than the ~910 found in the manual audit. ` +
-      `Double-check PIM_API_USERNAME / PIM_API_PASSWORD are valid, and that ` +
-      `Lookup List Items really do carry the same SKUs as BTO's picklist items, before trusting this.`
+  // --- SAFETY FLOOR --------------------------------------------------------
+  // Never write (and therefore never commit) a result this low-confidence.
+  // Exiting non-zero here means the workflow job fails loudly and visibly
+  // (so it shows up as a red X in Actions / GitHub notifications), and the
+  // "commit if changed" step never runs — today's already-committed data
+  // stays exactly as it was.
+  if (skus.length < MIN_SKUS) {
+    console.error(
+      `REFUSING TO WRITE: only ${skus.length} SKUs found (minimum trusted floor is ${MIN_SKUS}; ` +
+      `the manual v3 audit found ~910). This means the Lookup List API is very likely NOT the same ` +
+      `data as BTO's configurator picklists, or the SKU field lives under a key this script doesn't ` +
+      `check yet — see the DEBUG dump above for the real field names, then either fix extractSku() ` +
+      `or fall back to requesting BTO-management's own API from Chainbox. Leaving the previously ` +
+      `committed data/exclusion-list.* files untouched.`
     );
+    process.exit(1);
   }
+  // --------------------------------------------------------------------------
 
   const generated_at = new Date().toISOString();
 
