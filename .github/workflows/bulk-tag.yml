@@ -1,0 +1,52 @@
+name: Bulk-tag BTO SKUs in PIM
+
+# ONE-TIME (re-runnable/idempotent) job — NOT on a schedule. Sets the custom
+# PIM attribute `bto-picklist-exclude: true` on every SKU currently listed in
+# data/exclusion-list.json, via Chainbox's PATCH /products (Patch Multiple)
+# endpoint. The attribute itself was created manually in the PIM admin UI
+# first (Define > Attributes) — this workflow only sets values, never
+# creates schema.
+#
+# Safe to re-run: PATCH just re-sets the same field to true each time.
+#
+# Inputs let you do a --dry-run or a small --limit smoke test from the
+# Actions tab before tagging all ~910 SKUs for real.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (log only, no writes)"
+        type: boolean
+        default: false
+      limit:
+        description: "Only tag the first N SKUs (leave empty for all)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  bulk-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Bulk-tag SKUs
+        env:
+          PIM_API_BASE_URL: ${{ secrets.PIM_API_BASE_URL }}
+          PIM_ORG_ID: ${{ secrets.PIM_ORG_ID }}
+          PIM_PIM_ID: ${{ secrets.PIM_PIM_ID }}
+          PIM_API_USERNAME: ${{ secrets.PIM_API_USERNAME }}
+          PIM_API_PASSWORD: ${{ secrets.PIM_API_PASSWORD }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ -n "${{ inputs.limit }}" ]; then ARGS="$ARGS --limit ${{ inputs.limit }}"; fi
+          echo "Running: node scripts/bulk-tag-skus.mjs $ARGS"
+          node scripts/bulk-tag-skus.mjs $ARGS
