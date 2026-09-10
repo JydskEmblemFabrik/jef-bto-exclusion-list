@@ -65,6 +65,28 @@ async function search(body, limit) {
   }
 }
 
+// Baseline PROBE 3 showed product IDs that look exactly like SKUs (e.g.
+// " H-RI-YEP106"), so — since /productsearch's "sku" filter field turned out
+// to be unsupported ("sku has no mapping/type and thus cannot be used for
+// search") — try GET /product/:productid directly using each known-excluded
+// SKU as the id.
+async function getProduct(productId) {
+  const url = `${API_ROOT}/product/${encodeURIComponent(productId)}`;
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: { Authorization: authHeader() },
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    return { ok: false, status: res.status, body: text.slice(0, 500) };
+  }
+  try {
+    return { ok: true, data: JSON.parse(text) };
+  } catch {
+    return { ok: false, status: 'parse-error', body: text.slice(0, 500) };
+  }
+}
+
 // A representative sample of SKUs we KNOW belong in the exclusion list,
 // per the manually-audited v3 report (910 SKUs). Deliberately varied:
 // plain numeric-looking picks, engraving/print picks, ribbon/band picks,
@@ -95,14 +117,26 @@ async function main() {
     console.log('Sample records:', JSON.stringify(variantParentResult.data, null, 2).slice(0, 3000));
   }
 
-  console.log('\n=== PROBE 2: look up known-excluded SKUs by filter field "sku" EQ ===');
-  for (const sku of KNOWN_EXCLUDED_SKUS) {
+  console.log('\n=== PROBE 2: look up known-excluded SKUs by filter field "sku" EQ (expected to fail — kept for the record) ===');
+  {
+    const sku = KNOWN_EXCLUDED_SKUS[0];
     const result = await search({
       filter: { rules: [{ field: 'sku', operator: 'EQ', value: sku }], groupingOperator: 'AND' },
     }, 5);
     if (result) {
       console.log(`--- SKU "${sku}" -> counts=${JSON.stringify(result.counts)} ---`);
       console.log(JSON.stringify(result.data, null, 2));
+    }
+  }
+
+  console.log('\n=== PROBE 4: GET /product/:productid directly, using each known-excluded SKU as the id ===');
+  for (const sku of KNOWN_EXCLUDED_SKUS) {
+    const result = await getProduct(sku);
+    if (result.ok) {
+      console.log(`--- SKU "${sku}" -> FOUND ---`);
+      console.log(JSON.stringify(result.data, null, 2));
+    } else {
+      console.log(`--- SKU "${sku}" -> NOT FOUND (status=${result.status}) ${result.body} ---`);
     }
   }
 
