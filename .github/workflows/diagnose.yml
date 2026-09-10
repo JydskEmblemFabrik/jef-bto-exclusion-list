@@ -1,0 +1,31 @@
+name: Diagnose PIM productsearch
+
+# One-off, manual-only diagnostic (no schedule). Investigates whether the
+# PIM Product resource's /productsearch endpoint can identify BTO
+# configurator picklist SKUs, now that Lookup List / Lookup List Item has
+# been confirmed as a dead end. Read-only — never touches data/.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run productsearch diagnostics
+        env:
+          PIM_API_BASE_URL: ${{ secrets.PIM_API_BASE_URL }}
+          PIM_ORG_ID: ${{ secrets.PIM_ORG_ID }}
+          PIM_PIM_ID: ${{ secrets.PIM_PIM_ID }}
+          PIM_API_USERNAME: ${{ secrets.PIM_API_USERNAME }}
+          PIM_API_PASSWORD: ${{ secrets.PIM_API_PASSWORD }}
+        run: node scripts/diagnose-productsearch.mjs
