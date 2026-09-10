@@ -1,0 +1,53 @@
+name: Update BTO exclusion list
+
+# Runs every day and re-publishes the list of SKUs that must be excluded
+# from Meta/Google content_id matching, using Chainbox's official PIM API
+# (see scripts/build-exclusion-list.mjs for the logic and auth). The result
+# is committed to data/ in this repo, so it is always readable at a stable
+# "raw" URL, e.g.:
+#   https://raw.githubusercontent.com/<org>/<repo>/main/data/exclusion-list.json
+#
+# GTM (web + server/Stape) should fetch that URL with a few hours of cache
+# rather than calling BTO's API directly on every event.
+
+on:
+  schedule:
+    # 04:00 UTC daily (~05:00/06:00 Danish time depending on DST).
+    # Adjust if you want a different time — this only needs to run once a day.
+    - cron: '0 4 * * *'
+  workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit the refreshed list
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build exclusion list from Chainbox's PIM API
+        env:
+          # See SETUP.md — these come from the Chainbox-issued PIM API user.
+          PIM_API_BASE_URL: ${{ secrets.PIM_API_BASE_URL }}
+          PIM_ORG_ID: ${{ secrets.PIM_ORG_ID }}
+          PIM_PIM_ID: ${{ secrets.PIM_PIM_ID }}
+          PIM_API_USERNAME: ${{ secrets.PIM_API_USERNAME }}
+          PIM_API_PASSWORD: ${{ secrets.PIM_API_PASSWORD }}
+        run: node scripts/build-exclusion-list.mjs
+
+      - name: Commit updated list (only if it changed)
+        run: |
+          git config user.name "bto-exclusion-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/exclusion-list.json data/exclusion-list.txt data/exclusion-list.regex.txt
+          if git diff --cached --quiet; then
+            echo "No changes — list is identical to yesterday's."
+          else
+            git commit -m "Auto-update BTO exclusion list"
+            git push
+          fi
