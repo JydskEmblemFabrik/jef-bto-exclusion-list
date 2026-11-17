@@ -102,25 +102,65 @@ function isRestrictedToCustomer(attrs) {
   return nonEmpty(a) || nonEmpty(b);
 }
 
-async function searchPage(lastoffsetid) {
+// Chainbox occasionally answers a single page with a transient 502/503/504
+// (run #71 died on a 502 around page 261 of ~380). Retry those, 429 and
+// network errors with exponential backoff instead of failing the whole run.
+// Any other 4xx (bad credentials, bad request) still fails immediately.
+const MAX_ATTEMPTS = 5;
+const RETRY_DELAYS_MS = [5000, 10000, 20000, 40000, 60000];
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function retryAfterMs(res) {
+  const header = res.headers.get('retry-after');
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const date = Date.parse(header);
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  return null;
+}
+
+async function searchPage(lastoffsetid, page) {
   const params = new URLSearchParams({ limit: '250' });
   if (lastoffsetid) params.set('lastoffsetid', lastoffsetid);
   const url = `${API_ROOT}/productsearch?${params.toString()}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: authHeader(),
-      'Content-Type': 'application/json',
-    },
-    // No filter: this has to see every product to correctly classify each
-    // one, not just the ones someone already suspected were bad.
-    body: JSON.stringify({}),
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`POST /productsearch failed: ${res.status} ${res.statusText}\n${text.slice(0, 1000)}`);
+  for (let attempt = 1; ; attempt++) {
+    let res;
+    let text;
+    let reason;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: authHeader(),
+          'Content-Type': 'application/json',
+        },
+        // No filter: this has to see every product to correctly classify each
+        // one, not just the ones someone already suspected were bad.
+        body: JSON.stringify({}),
+      });
+      text = await res.text();
+    } catch (err) {
+      reason = `network error: ${err?.cause?.code || err?.message || err}`;
+      if (attempt >= MAX_ATTEMPTS) {
+        throw new Error(`POST /productsearch failed after ${attempt} attempts (page ${page}): ${reason}`);
+      }
+    }
+    if (res && text !== undefined) {
+      if (res.ok) return JSON.parse(text);
+      if (!RETRYABLE_STATUSES.has(res.status) || attempt >= MAX_ATTEMPTS) {
+        throw new Error(`POST /productsearch failed: ${res.status} ${res.statusText} (page ${page}, attempt ${attempt}/${MAX_ATTEMPTS})\n${text.slice(0, 1000)}`);
+      }
+      reason = `${res.status} ${res.statusText}`;
+    }
+    const fromHeader = res ? retryAfterMs(res) : null;
+    // Honour Retry-After, but never sleep more than 2 minutes on one page.
+    const delay = fromHeader !== null ? Math.min(fromHeader, 120000) : RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)];
+    console.warn(`  retry ${attempt + 1}/${MAX_ATTEMPTS} after ${Math.round(delay / 1000)}s: ${reason}, page ${page}`);
+    await sleep(delay);
   }
-  return JSON.parse(text);
 }
 
 async function main() {
@@ -133,7 +173,7 @@ async function main() {
   let page = 0;
   while (true) {
     page++;
-    const result = await searchPage(lastoffsetid);
+    const result = await searchPage(lastoffsetid, page);
     const entries = Object.entries(result.data || {});
     for (const [id, product] of entries) {
       totalScanned++;
